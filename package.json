@@ -1,0 +1,64 @@
+{
+  "name": "tile-merger",
+  "version": "0.1.0",
+  "description": "瓦片图层合并工具：将基本图层与标注图层按 XYZ 坐标对齐叠加，输出合并后的瓦片目录（或一整张图片）",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "tile-merger": "bin/cli.js"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "bin",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18.17"
+  },
+  "keywords": [
+    "tile",
+    "map",
+    "tiles",
+    "merge",
+    "overlay",
+    "xyz",
+    "tms",
+    "gis",
+    "瓦片",
+    "图层合并"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lemonppai/tile-merger.git"
+  },
+  "scripts": {
+    "start": "node bin/cli.js",
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "fixtures": "node tests/make-fixtures.mjs",
+    "test": "node tests/run.mjs",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "adm-zip": "^0.5.16",
+    "cfonts": "^3.3.1",
+    "chalk": "^5.6.2",
+    "inquirer": "^14.0.2",
+    "log-symbols": "^7.0.1",
+    "sharp": "^0.33.5"
+  },
+  "devDependencies": {
+    "@types/adm-zip": "^0.5.7",
+    "@types/node": "^22.10.5",
+    "esbuild": "^0.28.1",
+    "typescript": "^5.7.3"
+  }
+}
