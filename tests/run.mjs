@@ -8,7 +8,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import sharp from 'sharp';
 import { FIXTURES, GRID, MARK, TILE, baseColor, makeFixtures } from './make-fixtures.mjs';
-import { mergeTiles, resolveFormat, layoutTemplate } from '../dist/index.js';
+import { mergeTiles, resolveFormat, layoutTemplate, resolveCompression, pngColorsForQuality } from '../dist/index.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const outDir = path.join(root, 'tmp', 'test-output');
@@ -507,6 +507,108 @@ async function run() {
     });
     assert.equal(result.layout, '3/{x}/{y}.webp');
     assert.ok(listFiles(extOut).includes('3/2/1.webp'), `实际：${listFiles(extOut).join(', ')}`);
+  });
+
+  console.log('\n  ── 图片压缩比例 ──');
+
+  await test('24) 压缩档位解析：内置档位 / 百分比 / 默认值', async () => {
+    // 默认档位必须与旧版本行为一致（质量 90，PNG 不量化）
+    assert.equal(resolveCompression().id, 'high');
+    assert.equal(resolveCompression().quality, 90);
+    assert.equal(resolveCompression().pngColors, null);
+    assert.equal(tileResult.compression.id, 'high');
+    assert.equal(tileResult.compression.pngColors, null);
+
+    assert.equal(resolveCompression({ compression: 'lossless' }).quality, 100);
+    assert.equal(resolveCompression({ compression: 'tiny' }).quality, 30);
+    assert.equal(resolveCompression({ compression: 55 }).quality, 55);
+    assert.equal(resolveCompression({ compression: '45' }).quality, 45);
+    assert.equal(resolveCompression({ compression: '60%' }).quality, 60);
+    assert.equal(resolveCompression({ quality: 75 }).quality, 75);
+
+    // PNG 调色板色数：接近无损不量化，比例越低色数越少
+    assert.equal(pngColorsForQuality(100), null);
+    assert.equal(pngColorsForQuality(96), null);
+    assert.equal(resolveCompression({ compression: 'high' }).pngColors, null);
+    const balanced = resolveCompression({ compression: 'balanced' }).pngColors;
+    const tiny = resolveCompression({ compression: 'tiny' }).pngColors;
+    assert.ok(balanced > 0 && balanced < 256, `均衡档应启用调色板，实际 ${balanced}`);
+    assert.ok(tiny < balanced, `极小档色数(${tiny}) 应少于均衡档(${balanced})`);
+    assert.throws(() => resolveCompression({ compression: 'ultra' }), /未知的压缩档位/);
+  });
+
+  await test('25) PNG 档位越小体积越小，尺寸与内容仍有效', async () => {
+    const sizes = {};
+    for (const level of ['lossless', 'balanced', 'tiny']) {
+      const dir = path.join(outDir, `tiles-compress-${level}`);
+      const result = await mergeTiles({
+        inputs: [basic, label],
+        outputDir: dir,
+        compression: level,
+        overwrite: true,
+      });
+      assert.equal(result.tileCount, cols * rows);
+      assert.equal(result.compression.id, level);
+      sizes[level] = result.bytes;
+      const file = tileFile(dir, GRID.z, GRID.minX, GRID.minY);
+      const meta = await sharp(file).metadata();
+      assert.equal(meta.width, TILE);
+      assert.equal(meta.height, TILE);
+      await assertTile(file, GRID.minX, GRID.minY, { tolerance: level === 'tiny' ? 40 : 8 });
+    }
+    assert.ok(sizes.tiny < sizes.lossless, `极小档(${sizes.tiny}) 应小于无损档(${sizes.lossless})`);
+    assert.ok(sizes.tiny <= sizes.balanced, `极小档(${sizes.tiny}) 不应大于均衡档(${sizes.balanced})`);
+  });
+
+  await test('26) JPEG 输出：低档位体积更小', async () => {
+    const highOut = path.join(outDir, 'tiles-jpeg-lossless');
+    const lowOut = path.join(outDir, 'tiles-jpeg-tiny');
+    const high = await mergeTiles({
+      inputs: [basic, label],
+      outputDir: highOut,
+      format: 'jpeg',
+      compression: 'lossless',
+      overwrite: true,
+    });
+    const low = await mergeTiles({
+      inputs: [basic, label],
+      outputDir: lowOut,
+      format: 'jpeg',
+      compression: 'tiny',
+      overwrite: true,
+    });
+    assert.equal(high.compression.quality, 100);
+    assert.equal(low.compression.quality, 30);
+    assert.ok(low.bytes < high.bytes, `极小档(${low.bytes}) 应小于无损档(${high.bytes})`);
+    assert.ok(listFiles(lowOut).includes('3/0/0.jpg'), `实际：${listFiles(lowOut).join(', ')}`);
+  });
+
+  await test('27) 单图模式同样按档位压缩（webp）', async () => {
+    const single = await mergeTiles({
+      inputs: [basic, label],
+      outputDir: outDir,
+      mode: 'single',
+      outputName: 'compressed.webp',
+      format: 'webp',
+      compression: 'balanced',
+      overwrite: true,
+    });
+    assert.equal(single.format, 'webp');
+    assert.equal(single.compression.id, 'balanced');
+    assert.equal(single.compression.quality, 70);
+    // 非 PNG 格式不做调色板量化
+    assert.equal(single.compression.pngColors, null);
+    assert.ok(single.bytes > 0);
+  });
+
+  await test('28) 非法档位报错，越界比例被夹取到 1-100', async () => {
+    await assert.rejects(
+      () => mergeTiles({ inputs: [basic], outputDir: outDir, compression: 'ultra' }),
+      /未知的压缩档位/,
+    );
+    assert.equal(resolveCompression({ compression: 0 }).quality, 1);
+    assert.equal(resolveCompression({ compression: 200 }).quality, 100);
+    assert.equal(resolveCompression({ compression: 200 }).pngColors, null);
   });
 
   console.log(`\n结果：${passed}/${passed + failures.length} 通过\n`);

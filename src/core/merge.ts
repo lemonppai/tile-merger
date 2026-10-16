@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import sharp from 'sharp';
+import { resolveCompression, type ResolvedCompression } from './compress';
 import { buildPlan } from './layout';
 import { openSource } from './source';
 import { scanLayer } from './scan';
@@ -139,9 +140,6 @@ export function expandOutLayout(
   return applyLayout(normalizeOutLayout(template), coord, format);
 }
 
-const clamp = (value: number, min: number, max: number): number =>
-  Math.min(max, Math.max(min, value));
-
 /** 判断 RGBA 缓冲区是否存在半透明/透明像素 */
 function hasTransparency(src: Uint8Array, pixels: number): boolean {
   for (let i = 3; i < pixels * 4; i += 4) {
@@ -261,7 +259,7 @@ function encode(
   width: number,
   height: number,
   format: OutputFormat,
-  options: { quality: number; compressionLevel: number; background: string },
+  options: Pick<RenderContext, 'quality' | 'pngCompressionLevel' | 'pngColors' | 'background'>,
 ) {
   const pipeline = sharp(Buffer.from(canvas.buffer, canvas.byteOffset, canvas.byteLength), {
     raw: { width, height, channels: 4 },
@@ -275,9 +273,21 @@ function encode(
       .jpeg({ quality: options.quality, mozjpeg: true });
   }
   if (format === 'webp') {
-    return pipeline.webp({ quality: options.quality });
+    // 质量 100 走 webp 的无损模式
+    return options.quality >= 100
+      ? pipeline.webp({ lossless: true, effort: 4 })
+      : pipeline.webp({ quality: options.quality });
   }
-  return pipeline.png({ compressionLevel: options.compressionLevel });
+  // PNG：默认无损压缩；档位启用调色板量化时限制色数以换取更小体积
+  return options.pngColors
+    ? pipeline.png({
+        compressionLevel: options.pngCompressionLevel,
+        palette: true,
+        colours: options.pngColors,
+        effort: 7,
+        dither: 1,
+      })
+    : pipeline.png({ compressionLevel: options.pngCompressionLevel });
 }
 
 /** 打开全部输入源并扫描为图层信息 */
@@ -397,8 +407,14 @@ async function pool<T>(items: T[], limit: number, worker: (item: T) => Promise<v
 
 interface RenderContext {
   format: OutputFormat;
+  /** 本次输出使用的压缩档位 */
+  compression: ResolvedCompression;
+  /** 编码用质量百分比（jpeg/webp 生效） */
   quality: number;
-  compressionLevel: number;
+  /** png 压缩等级（无损） */
+  pngCompressionLevel: number;
+  /** png 调色板色数；null 表示不量化 */
+  pngColors: number | null;
   background: string;
   backgroundFill: { r: number; g: number; b: number; alpha: number } | null;
   overwrite: boolean;
@@ -407,10 +423,17 @@ interface RenderContext {
 }
 
 function createContext(options: MergeTilesOptions, format: OutputFormat): RenderContext {
+  const compression = resolveCompression({
+    compression: options.compression ?? null,
+    quality: options.quality ?? null,
+  });
   return {
     format,
-    quality: clamp(options.quality ?? 90, 1, 100),
-    compressionLevel: clamp(options.compressionLevel ?? 6, 0, 9),
+    compression,
+    quality: compression.quality,
+    pngCompressionLevel: compression.pngCompressionLevel,
+    // 只有 png 会用到调色板量化
+    pngColors: format === 'png' ? compression.pngColors : null,
     background: options.background ?? '#ffffff',
     backgroundFill: options.background ? parseColor(options.background) : null,
     overwrite: options.overwrite !== false,
@@ -608,6 +631,12 @@ async function renderTiles(
     tileCount: written,
     emptySkipped,
     bytes,
+    compression: {
+      id: context.compression.id,
+      label: context.compression.label,
+      quality: context.compression.quality,
+      pngColors: context.pngColors,
+    },
     layerCount: plan.layers.length,
     holes: plan.holes,
     zooms,
@@ -736,6 +765,12 @@ async function renderSingle(
     tileCount: 1,
     emptySkipped: 0,
     bytes: stat.size,
+    compression: {
+      id: context.compression.id,
+      label: context.compression.label,
+      quality: context.compression.quality,
+      pngColors: context.pngColors,
+    },
     layerCount: plan.layers.length,
     holes: plan.holes,
     zooms: plan.zooms ?? (plan.z === null ? [] : [plan.z]),

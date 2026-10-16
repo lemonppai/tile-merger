@@ -1,6 +1,6 @@
 {
   "name": "tile-merger",
-  "version": "0.1.0",
+  "version": "1.4.0",
   "description": "瓦片图层合并工具：将基本图层与标注图层按 XYZ 坐标对齐叠加，输出合并后的瓦片目录（或一整张图片）",
   "type": "module",
   "license": "MIT",

@@ -1,6 +1,15 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+  COMPRESSION_PRESETS,
+  DEFAULT_COMPRESSION_ID,
+  compressionArg,
+  compressionFromQuality,
+  describeCompression,
+  resolveCompression,
+  type ResolvedCompression,
+} from './core/compress';
 import { compilePattern, isImageFile, parseTilePath } from './core/pattern';
 import { buildPlan } from './core/layout';
 import {
@@ -16,10 +25,23 @@ import { openSource } from './core/source';
 import type { MergePlan, MergeTilesResult, OutputFormat, OutputMode } from './core/types';
 import { askConfirm, askInput, askSelect, separator, type ChoiceOrSeparator } from './ui/ask';
 import { browseInteractively, promptOutputName } from './ui/browser';
-import { dialogDisabled, openInFileManager, pickDirectory, pickZipFiles } from './ui/dialog';
+import {
+  dialogDisabled,
+  isDialogSupported,
+  openInFileManager,
+  pickDirectory,
+  pickZipFiles,
+} from './ui/dialog';
 import { createProgressRenderer, logger } from './ui/logger';
 
 export { buildPlan, inspectTiles, layoutTemplate, mergeTiles, openSource, resolveFormat };
+export {
+  COMPRESSION_PRESETS,
+  compressionFromQuality,
+  describeCompression,
+  pngColorsForQuality,
+  resolveCompression,
+} from './core/compress';
 export type * from './core/types';
 
 /** 单张整图超过该字节数时提示内存风险（约 2GB RGBA） */
@@ -35,6 +57,8 @@ export interface CliOptions {
   pattern?: string | null;
   outLayout?: string | null;
   tms: boolean;
+  /** 压缩档位名或 1-100 百分比 */
+  compression?: string;
   quality?: number;
   concurrency?: number;
   keepEmpty: boolean;
@@ -122,9 +146,18 @@ export function parseArgs(argv: string[]): CliOptions {
       case '--out-layout':
         options.outLayout = next() ?? null;
         break;
-      case '--quality':
-        options.quality = Number(next());
+      case '--compress':
+      case '--compression':
+        options.compression = next();
         break;
+      case '--quality': {
+        // 兼容数字（1-100）与档位名（lossless/high/...）
+        const raw = next() ?? '';
+        const num = Number(raw);
+        if (Number.isFinite(num) && raw.trim() !== '') options.quality = num;
+        else options.compression = raw.trim();
+        break;
+      }
       case '-c':
       case '--concurrency':
         options.concurrency = Number(next());
@@ -193,7 +226,10 @@ tile-merger — 瓦片图层合并工具
       --out-layout <模板>  自定义输出结构，如 "{z}/{x}/{y}"、"{x}/{y}/{z}"、
                            "{z}/{x}_{y}"（缺省 {z}/{x}/{y}，无层级时 {x}/{y}）
       --tms                输入为 TMS 坐标系（Y 轴自下而上），对所有图层统一生效
-      --quality <1-100>    jpg/webp 质量，缺省 90
+      --compress <档位>    图片压缩比例，可选：
+                             lossless 无损原图 / high 高质量（缺省）/ balanced 均衡
+                             / small 小体积 / tiny 极小体积，也可直接写 1-100 的百分比
+      --quality <1-100>    同上（等价于 --compress 传百分比），缺省 90
   -c, --concurrency <n>    tiles 模式并发数，缺省 min(8, CPU 核数)
       --keep-empty         完全透明的瓦片也写出（缺省跳过）
       --no-overwrite       已存在的瓦片/文件不覆盖（tiles 模式跳过并提示）
@@ -204,7 +240,7 @@ tile-merger — 瓦片图层合并工具
   -v, --version            查看版本
 `.trim();
 
-const VERSION = '1.2.0';
+const VERSION = '1.3.0';
 
 const labelOf = (p: string): string => path.basename(p);
 
@@ -250,6 +286,7 @@ function printPlan(
   mode: OutputMode,
   format: OutputFormat,
   outLayout?: string | null,
+  compression?: ResolvedCompression,
 ): void {
   console.log('');
   for (const layer of plan.layers) {
@@ -278,12 +315,18 @@ function printPlan(
     console.log(`   输出尺寸   ${plan.width} × ${plan.height} px（一整张图片）`);
   }
   console.log(`   瓦片总数   ${plan.totalTiles} 张`);
+  if (compression) {
+    console.log(
+      `   压缩比例   ${logger.accent(describeCompression(compression, format))}` +
+        `  ${logger.dim(`（输出格式 ${format.toUpperCase()}）`)}`,
+    );
+  }
   console.log('');
 }
 
 /** 让用户选择一批图层来源 */
 async function pickSources(): Promise<string[]> {
-  const useDialog = !dialogDisabled();
+  const useDialog = !dialogDisabled() && isDialogSupported();
   const choices: ChoiceOrSeparator<string>[] = [];
   if (useDialog) {
     choices.push({ name: '📁 选择图层文件夹（系统对话框）', value: 'dialog-dir' });
@@ -300,7 +343,7 @@ async function pickSources(): Promise<string[]> {
   });
 
   if (method === 'dialog-dir') {
-    const picked = pickDirectory('请选择瓦片图层文件夹');
+    const picked = pickDirectory('请选择瓦片图层文件夹', process.cwd());
     if (!picked) logger.warn('未选择任何文件夹');
     return picked ? [picked] : [];
   }
@@ -479,8 +522,8 @@ async function collectInputs(inputs: string[], cli: CliOptions): Promise<void> {
 /** 选择输出文件夹 */
 async function promptOutputDir(): Promise<string> {
   const cwd = process.cwd();
-  if (!dialogDisabled()) {
-    const picked = pickDirectory('请选择合并结果的输出文件夹');
+  if (!dialogDisabled() && isDialogSupported()) {
+    const picked = pickDirectory('请选择合并结果的输出文件夹', cwd);
     if (picked) return picked;
   }
   const method = await askSelect<string>({
@@ -499,6 +542,40 @@ async function promptOutputDir(): Promise<string> {
   const raw = await askInput({ message: '请输入输出文件夹路径', default: cwd });
   const trimmed = raw.trim().replace(/^"(.*)"$/, '$1');
   return path.resolve(trimmed || cwd);
+}
+
+/** 选择图片压缩比例 */
+async function promptCompression(format: OutputFormat): Promise<ResolvedCompression> {
+  console.log(
+    logger.dim(
+      format === 'png'
+        ? '   PNG 为无损格式：「无损原图」「高质量」不做色数压缩；更低档位会启用调色板量化以减小体积'
+        : `   ${format.toUpperCase()} 为有损格式：比例越低体积越小、画质损失越多（100 = 最高质量）`,
+    ),
+  );
+  const choices: ChoiceOrSeparator<string>[] = COMPRESSION_PRESETS.map((preset) => ({
+    name:
+      `${preset.label}   ${logger.dim(preset.hint)}` +
+      (preset.id === DEFAULT_COMPRESSION_ID ? logger.accent('   ← 推荐') : ''),
+    value: preset.id,
+  }));
+  choices.push(separator());
+  choices.push({ name: '⚙️  自定义压缩比例（输入 1-100）', value: 'custom' });
+
+  const picked = await askSelect<string>({ message: '选择图片压缩比例', choices });
+  if (picked !== 'custom') return resolveCompression({ compression: picked });
+
+  const raw = await askInput({
+    message: '请输入压缩比例（1-100，100 为无损）',
+    default: '80',
+    validate: (value) => {
+      const num = Number(value.trim());
+      return Number.isFinite(num) && num >= 1 && num <= 100
+        ? true
+        : '请输入 1-100 之间的数字';
+    },
+  });
+  return compressionFromQuality(Number(raw.trim()));
 }
 
 function printResult(result: MergeTilesResult): void {
@@ -523,6 +600,7 @@ function printResult(result: MergeTilesResult): void {
   }
   console.log(`   ${pad('图层数量', 12)} ${result.layerCount} 个图层`);
   if (result.z !== null) console.log(`   ${pad('层级 z', 12)} ${result.z}`);
+  console.log(`   ${pad('压缩比例', 12)} ${describeCompression(result.compression, result.format)}`);
   console.log(`   ${pad('文件大小', 12)} ${fmtBytes(result.bytes)}`);
   console.log(`   ${pad('耗时', 12)} ${(result.durationMs / 1000).toFixed(2)} s`);
   if (result.warnings.length) {
@@ -560,7 +638,7 @@ export async function generate(argv: string[] = process.argv.slice(2)): Promise<
 
   let step = 0;
   const head = (text: string): void => {
-    const marks = ['①', '②', '③', '④', '⑤'];
+    const marks = ['①', '②', '③', '④', '⑤', '⑥', '⑦', '⑧', '⑨', '⑩'];
     const label = interactive ? `${marks[step++] ?? '•'} ` : '';
     logger.title(`${label}${text}`);
   };
@@ -603,7 +681,20 @@ export async function generate(argv: string[] = process.argv.slice(2)): Promise<
     outputName = await promptOutputName(defaultName);
   }
 
-  // ④ 解析图层坐标
+  const format: OutputFormat = cli.format ?? 'png';
+
+  // ④ 图片压缩比例
+  const hasCompressionArg = cli.compression !== undefined || cli.quality !== undefined;
+  let compression = resolveCompression({
+    compression: cli.compression ?? null,
+    quality: cli.quality ?? null,
+  });
+  if (interactive && !hasCompressionArg) {
+    head('选择图片压缩比例');
+    compression = await promptCompression(format);
+  }
+
+  // ⑤ 解析图层坐标
   head('解析图层坐标');
   const progress = createProgressRenderer();
   let plan: MergePlan;
@@ -617,8 +708,7 @@ export async function generate(argv: string[] = process.argv.slice(2)): Promise<
     progress.done();
   }
 
-  const format: OutputFormat = cli.format ?? 'png';
-  printPlan(plan, mode, format, outLayout);
+  printPlan(plan, mode, format, outLayout, compression);
 
   if (cli.debug) {
     for (const layer of plan.layers) {
@@ -670,7 +760,7 @@ export async function generate(argv: string[] = process.argv.slice(2)): Promise<
     pattern: cli.pattern,
     outLayout,
     tms: cli.tms,
-    quality: cli.quality,
+    compression: compressionArg(compression),
     concurrency: cli.concurrency,
     keepEmpty: cli.keepEmpty,
     overwrite: cli.overwrite,

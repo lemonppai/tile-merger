@@ -15,6 +15,18 @@ export type OutputFormat = 'png' | 'jpeg' | 'webp';
  */
 export type OutputMode = 'tiles' | 'single';
 
+/** 输出图片的压缩档位信息 */
+export interface CompressionInfo {
+  /** 档位 id（lossless / high / balanced / small / tiny / custom） */
+  id: string;
+  /** 档位名称 */
+  label: string;
+  /** 质量百分比 1-100，100 为无损 */
+  quality: number;
+  /** PNG 调色板量化色数；null 表示未启用调色板（无损） */
+  pngColors: number | null;
+}
+
 /** 一个图层输入源（文件夹或 zip 的统一抽象） */
 export interface TileSource {
   kind: SourceKind;
@@ -134,6 +146,8 @@ export interface MergeTilesResult {
   emptySkipped: number;
   /** 写出文件总字节数 */
   bytes: number;
+  /** 实际使用的压缩档位 */
+  compression: CompressionInfo;
   layerCount: number;
   holes: number;
   /** 结果涉及的层级集合（升序去重）；无层级信息时为空数组 */
@@ -162,9 +176,14 @@ export interface MergeTilesOptions {
   pattern?: string | null;
   /** 输入为 TMS（Y 轴自下而上），对所有图层统一生效 */
   tms?: boolean;
-  /** jpeg/webp 质量，1-100 */
+  /**
+   * 压缩档位：内置档位名（lossless / high / balanced / small / tiny）
+   * 或 1-100 的百分比。缺省为 high（质量 90）。
+   */
+  compression?: string | number | null;
+  /** jpeg/webp 质量，1-100（等价于 compression 传百分比） */
   quality?: number;
-  /** png 压缩等级 0-9 */
+  /** png 压缩等级 0-9（已被压缩档位接管，保留以兼容旧调用） */
   compressionLevel?: number;
   /**
    * 自定义输出目录结构模板（tiles 模式），支持 `{z}` `{x}` `{y}` `{ext}` 占位符。
